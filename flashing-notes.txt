@@ -1,0 +1,8 @@
+"RUN: Global asynchronous reset pin. Reset when driven low, run when driven high. If no external reset is required, this pin can be tied directly to IOVDD."
+
+To enter bootloader mode on these boards, follow this procedure:
+	1. Unplug the board from the PC and hold reset button
+	2. Connect the board to computer with USB cable
+	3. A new disk drive named RPI-RP2 will appear
+	4. Release the reset button
+
