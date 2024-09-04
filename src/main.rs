@@ -9,13 +9,13 @@ use rp2040_hal::{
     gpio::{bank0, FunctionSio, Pin, PinState, Pins, PullDown, SioOutput},
     pac::Peripherals,
     usb::UsbBus,
-    Sio, {Timer, Watchdog},
+    Sio, Timer, Watchdog,
 };
 
 use usb_device::{class_prelude::*, prelude::*};
-use usbd_serial::SerialPort;
+use usbd_serial::{embedded_io::Write, SerialPort};
 
-use core::fmt::Write;
+use core::fmt::Write as OtherWrite;
 use core::panic::PanicInfo;
 use heapless::String;
 
@@ -118,8 +118,6 @@ fn main() -> ! {
         LED_RED = Some(led_red);
     }
 
-    // TODO: If using RP2040B0 or B1 investigate the issue referenced here
-    // https://docs.rs/rp2040-hal/latest/rp2040_hal/usb/index.html
     let usb_bus = UsbBusAllocator::new(UsbBus::new(
         pac.USBCTRL_REGS,
         pac.USBCTRL_DPRAM,
@@ -128,17 +126,15 @@ fn main() -> ! {
         &mut pac.RESETS,
     ));
 
-    // Set up the USB Communications Class Device driver
     let mut serial = SerialPort::new(&usb_bus);
 
-    // Create a USB device with a fake VID and PID
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
             .manufacturer("Fake company")
             .product("Serial port")
             .serial_number("TEST")])
         .unwrap()
-        .device_class(2) // from: https://www.usb.org/defined-class-codes
+        .device_class(2)
         .build();
 
     enum Command {
@@ -153,29 +149,36 @@ fn main() -> ! {
     let mut command_buffer_len = 0;
     let mut input_buffer = [0u8; 32];
     let mut green_led_counter = unsafe { TIMER.unwrap().get_counter() };
+
     loop {
         if usb_dev.poll(&mut [&mut serial]) {
             match serial.read(&mut input_buffer) {
-                Err(_e) => (),
-                Ok(0) => (),
+                Err(_) | Ok(0) => (),
                 Ok(count) => {
                     for byte in input_buffer.iter().take(count) {
                         if command_buffer_len == COMMAND_BUFFER_CAPACITY {
-                            _ = serial.write(b"command buffer full, clearing command buffer\n");
+                            _ = serial.write_all(&input_buffer);
+                            _ = serial.write_all(
+                                b"\r\nCommand buffer is full, clearing command buffer!\r\n",
+                            );
                             command_buffer_len = 0;
                             break;
                         }
+
                         command_buffer[command_buffer_len] = *byte;
                         command_buffer_len += 1;
+
                         if *byte == b'\r' {
                             _ = serial.write(b"\\r\r\n");
+                            command_buffer_len -= 1;
                             break;
                         }
-                        _ = serial.write(&[*byte]);
+                        _ = serial.write_all(&[*byte]);
                     }
                 }
             }
         }
+
         let mut command: Option<Command> = None;
         if command_buffer[command_buffer_len] == b'\r' {
             match command_buffer[0..command_buffer_len] {
@@ -183,22 +186,25 @@ fn main() -> ! {
                     command = Some(Command::Get);
                 }
                 [b'S', b'e', b't', b' ', ..] => {
-                    let mut number: String<16> = String::new();
+                    let mut number: String<32> = String::new();
                     for byte in command_buffer[4..command_buffer_len].iter() {
                         number.push(*byte as char).unwrap();
                     }
                     if let Ok(n) = number.parse::<usize>() {
                         command = Some(Command::Set(n));
                     } else {
-                        _ = serial.write(b"failed parsing number to set");
+                        _ = serial.write_all(b"failed parsing number to set");
                     }
                 }
-                _ => _ = serial.write(b"unrecognized command"),
+                _ => {
+                    _ = serial.write_all(b"unrecognized command");
+                    command_buffer_len = 0;
+                }
             }
         }
         match command {
             Some(Command::Get) => {
-                let mut text: String<16> = String::new();
+                let mut text: String<32> = String::new();
                 writeln!(&mut text, "current value: {}", dummy_user_controlled_value).unwrap();
             }
             Some(Command::Set(n)) => {
@@ -206,6 +212,7 @@ fn main() -> ! {
             }
             None => (),
         }
+
         let current_count = unsafe { TIMER.unwrap().get_counter() };
         if (current_count - green_led_counter).to_millis() > 1000 {
             green_led_counter = current_count;
