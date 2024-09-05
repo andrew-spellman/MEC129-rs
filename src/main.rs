@@ -1,13 +1,14 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::{adc::OneShot, digital::v2::OutputPin};
+use embedded_hal::{adc::OneShot, digital::v2::OutputPin, PwmPin};
 
 use rp2040_hal::{
     adc::{Adc, AdcPin},
     clocks::init_clocks_and_plls,
-    gpio::{PinState, Pins},
+    gpio::Pins,
     pac::Peripherals,
+    pwm::{FreeRunning, Slices},
     usb::UsbBus,
     Sio, Timer, Watchdog,
 };
@@ -124,7 +125,32 @@ fn main() -> ! {
     let _eeprom_sda = pins.gpio21.into_push_pull_output();
 
     // Pull down HV_PWM to stop the HV Supply from pulling a large current
-    let _hv_pwm = pins.gpio22.into_push_pull_output_in_state(PinState::Low);
+    // let _hv_pwm = pins.gpio22.into_push_pull_output_in_state(PinState::Low);
+
+    let pwm_slices = Slices::new(pac.PWM, &mut pac.RESETS);
+
+    // 8 slices, each with 2 channels
+    // each of the 30 gpio pins is associated with one of these 16 channels
+    // see 4.5.2 page 525 for which channel to use
+    // wanting to use channel 3A here for hv_pwm on gpio 22
+    let mut pwm = pwm_slices.pwm3;
+
+    // we want 100khz which is 1/1250th of the 125Mhz clk_sys
+    // for this, for every output clock cycle we will:
+    //     count once per clock cycle (int = 1, frac = 0)
+    //     up to top = 1249 (there's an implicit +1)
+    pwm.set_div_int(1u8);
+    pwm.set_div_frac(0u8);
+    // TODO: this " / 2" is temporary for testing
+    pwm.set_top(1249u16 / 2);
+    pwm.enable();
+
+    // counter is free-running, and will count continuously whenever the slice is enabled
+    let pwm = pwm.into_mode::<FreeRunning>();
+
+    let mut channel_hv_pwm = pwm.channel_a;
+    let _hv_pwm = channel_hv_pwm.output_to(pins.gpio22);
+    channel_hv_pwm.set_duty(0);
 
     let _rh_pwm = pins.gpio23.into_push_pull_output();
     let _tec_pwm = pins.gpio24.into_push_pull_output();
@@ -162,12 +188,8 @@ fn main() -> ! {
         Get,
         Set(usize),
         GetHVFeed,
+        SetHVPWM(usize),
     }
-
-    /*
-        get hvfeed analog digital converter
-        0-3.3 -> 0-x (voltage divider)
-    */
 
     let mut dummy_user_controlled_value = 42;
 
@@ -207,17 +229,25 @@ fn main() -> ! {
                 [b'g', b'e', b't', b' ', b'h', b'v', b' ', b'f', b'e', b'e', b'd', ..] => {
                     command = Some(Command::GetHVFeed);
                 }
+                // set duty *
+                [b's', b'e', b't', b' ', b'd', b'u', b't', b'y', ..] => {
+                    if let Some(n) = usize_from_bytes(&input_buffer[9..input_buffer_len - 1]) {
+                        if n < 1024 {
+                            command = Some(Command::SetHVPWM(n));
+                        } else {
+                            _ = serial.write_all(b"duty must be in range 0..1024\r\n");
+                        }
+                    } else {
+                        _ = serial.write_all(b"failed parsing number to set\r\n");
+                    }
+                }
                 // get*
                 [b'g', b'e', b't', ..] => {
                     command = Some(Command::Get);
                 }
                 // set *
                 [b's', b'e', b't', b' ', ..] => {
-                    let mut number: String<32> = String::new();
-                    for byte in input_buffer[4..input_buffer_len - 1].iter() {
-                        number.push(*byte as char).unwrap();
-                    }
-                    if let Ok(n) = number.parse::<usize>() {
+                    if let Some(n) = usize_from_bytes(&input_buffer[4..input_buffer_len - 1]) {
                         command = Some(Command::Set(n));
                     } else {
                         _ = serial.write_all(b"failed parsing number to set\r\n");
@@ -250,6 +280,9 @@ fn main() -> ! {
                 let volts_hv_feed = divided_volts_hv_feed * (6.49f32 + 1000f32) / 6.49f32;
                 write!(serial, "volts_hv_feed : {}\r\n", volts_hv_feed).unwrap();
             }
+            Some(Command::SetHVPWM(n)) => {
+                channel_hv_pwm.set_duty(n as u16);
+            }
             None => (),
         }
 
@@ -262,5 +295,17 @@ fn main() -> ! {
                 led_green.set_low().unwrap();
             }
         }
+    }
+}
+
+fn usize_from_bytes(input_slice: &[u8]) -> Option<usize> {
+    let mut number: String<32> = String::new();
+    for byte in input_slice.iter() {
+        number.push(*byte as char).unwrap();
+    }
+    if let Ok(n) = number.parse::<usize>() {
+        Some(n)
+    } else {
+        None
     }
 }
